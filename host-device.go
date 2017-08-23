@@ -1,4 +1,4 @@
-// Copyright 2015 CNI authors
+// Copyright 2017 CNI authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,13 +24,17 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/containernetworking/cni/pkg/ns"
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/version"
+	"github.com/containernetworking/cni/pkg/types"
+	"github.com/containernetworking/cni/pkg/types/current"
+	"github.com/containernetworking/plugins/pkg/ns"
+	"github.com/containernetworking/plugins/pkg/ipam"
 	"github.com/vishvananda/netlink"
 )
 
 type NetConf struct {
+	types.NetConf
 	Device     string `json:"device"`     // Device-Name, something like eth0 or can0 etc.
 	HWAddr     string `json:"hwaddr"`     // MAC Address of target network interface
 	KernelPath string `json:"kernelpath"` // Kernelpath of the device
@@ -64,7 +68,36 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return fmt.Errorf("failed to open netns %q: %v", args.Netns, err)
 	}
 	defer containerNs.Close()
-	return addLink(cfg.Device, cfg.HWAddr, cfg.KernelPath, containerNs)
+
+	err = addLink(cfg.Device, cfg.HWAddr, cfg.KernelPath, containerNs)
+
+        r, err := ipam.ExecAdd(cfg.IPAM.Type, args.StdinData)
+	if err != nil {
+		return err
+	}
+	result, err := current.NewResultFromResult(r)
+        if err != nil {
+                return err
+        }
+        for _, ipc := range result.IPs {
+                // All addresses belong to the interface
+                ipc.Interface = current.Int(0)
+        }
+	hostinterface := &current.Interface{}
+	hostinterface.Name=cfg.Device
+	hostinterface.Sandbox=containerNs.Path()
+	result.Interfaces = []*current.Interface{hostinterface}
+
+        err = containerNs.Do(func(_ ns.NetNS) error {
+                return ipam.ConfigureIface(cfg.Device, result)
+        })
+        if err != nil {
+                return err
+        }
+
+        result.DNS = cfg.DNS
+
+        return types.PrintResult(result, cfg.CNIVersion)
 }
 
 func cmdDel(args *skel.CmdArgs) error {
@@ -85,7 +118,8 @@ func addLink(device, hwAddr, kernelPath string, containerNs ns.NetNS) error {
 	if err != nil {
 		return err
 	}
-	return netlink.LinkSetNsFd(dev, int(containerNs.Fd()))
+	err = netlink.LinkSetNsFd(dev, int(containerNs.Fd()))
+	return err
 }
 
 func removeLink(device, hwAddr, kernelPath string, containerNs ns.NetNS) error {
